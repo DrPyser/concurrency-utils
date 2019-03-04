@@ -68,6 +68,10 @@ class MultiError(Exception):
     def __init__(self, exceptions):
         self._exceptions = exceptions
 
+    def __iter__(self):
+        return iter(self._exceptions)
+    
+    # TODO: add appropriate __repr__ and __str__
 
 class TaskGroupState(enum.Enum):
     OPEN = enum.auto()
@@ -79,9 +83,49 @@ class TaskGroupClosedError(Exception):
         super().__init__("Invalid operation on closed TaskGroup")
         self.task_group = task_group
 
+
+# Done = object()
+        
+# def const(x):
+#     return lambda y: x
+
+
+# def reraise_first(task_group, pred=const(True)):
+#     while True:
+#         try:
+#             x = (yield)
+#         except GeneratorExit:
+#             raise
+#         except Exception as ex:
+#             if pred(ex):
+#                 raise ex from ex
+#         else:
+#             if x is Done:    
+#                 return
+
+# def reraise_multi(task_group, pred=const(True)):
+#     exceptions = []
+#     # TODO
+#     while True:
+#         try:
+#             (yield)
+#         except GeneratorExit:
+#             raise
+#         except Exception as ex:
+#             if pred(ex):
+#                 exceptions.append(ex)
+
+
+async def default_join_policy(tasks, timeout=None):
+    waiter = asyncio.gather(*tasks)
+    if timeout is not None:
+        return await asyncio.wait_for(waiter, timeout)
+    else:
+        return await waiter
     
+
 class TaskGroup(TaskManager):
-    def __init__(self, tasks=(), timeout=None, logger=None, loop=None, name=None):
+    def __init__(self, tasks=(), join_policy=default_join_policy, logger=None, loop=None, name=None):
         self.name = name or str(id(self))
         self._tasks = set(tasks)
         self.logger = logger or logging.getLogger(
@@ -89,7 +133,7 @@ class TaskGroup(TaskManager):
         )
         self.loop = loop or asyncio.get_event_loop()
         self._state = TaskGroupState.OPEN
-        self._timeout = timeout
+        self._join_policy = join_policy
 
     @property
     def tasks(self):
@@ -124,10 +168,7 @@ class TaskGroup(TaskManager):
         return task
 
     def __await__(self):
-        if self._timeout is None:
-            yield from asyncio.gather(*self._tasks).__await__()
-        else:
-            yield from asyncio.wait_for(asyncio.gather(*self._tasks), self._timeout).__await__()
+        yield from self._join_policy(self.tasks).__await__()
 
     async def __aiter__(self):
         for t in self._tasks:
@@ -139,10 +180,11 @@ class TaskGroup(TaskManager):
 
     def cancel(self):
         """
-        Cancel all tasks in this task group
+        Cancel all running tasks in this task group
         """
         for t in self._tasks:
-            t.cancel()
+            if not t.done():
+                t.cancel()
             
     async def __aenter__(self):
         if self._state is TaskGroupState.CLOSED:
@@ -155,10 +197,10 @@ class TaskGroup(TaskManager):
             self.cancel()
         else:
             try:
-                await self
-            except:
+                await self._join_policy(self.tasks)
+            finally:
+                # tasks not awaited to completion by join policy are cancelled
                 self.cancel()
-                raise
 
     def __len__(self):
         return len(self._tasks)

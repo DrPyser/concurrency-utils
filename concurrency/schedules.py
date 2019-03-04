@@ -1,7 +1,18 @@
 import itertools
 import functools
 import asyncio
-from typing import Iterable, AsyncGenerator, TypeVar, Callable, NamedTuple, Any, Awaitable, Generator
+from typing import (
+    Iterable,
+    AsyncGenerator,
+    TypeVar,
+    Callable,
+    NamedTuple,
+    Any,
+    Awaitable,
+    Generator,
+    Generic,
+    Tuple
+)
 import enum
 
 A = TypeVar("A")
@@ -12,7 +23,7 @@ DelayStream = Iterable[float]
 """Type of a (potentially infinite) stream of delay values suitable for asyncio.sleep"""
 
 
-ScheduleState = Generator[A, B]
+ScheduleState = Generator[A, B, None]
 """Type of the internal state of a Schedule"""
 
             
@@ -45,13 +56,17 @@ def try_all(fs, *args):
         return results
 
     
-def delay_schedule(delay_stream):
+def recur_delay(delay_stream):
     x = (yield)
     for d in delay_stream:
         x = yield (x, d)
+
+
+def identity(x):
+    return x
+        
     
-    
-class Schedule:
+class Schedule(Generic[A, B]):
     """
     Wrapper for the state of a running schedule
     """
@@ -93,6 +108,11 @@ class Schedule:
         return self
         
     def feed(self, inputs):
+        """
+        Feed the schedule a stream of inputs(padded with None),
+        and return an iterator over the recurrences, 
+        until it's conclusion.
+        """
         extended_inputs = itertools.chain(
             inputs,
             itertools.repeat(None)
@@ -105,7 +125,7 @@ class Schedule:
 
     @classmethod
     def from_delay_stream(cls, delay_stream):        
-        return Schedule(delay_schedule(delay_stream))
+        return Schedule(recur_delay(delay_stream))
 
     def __or__(self, other):
         return Schedule(union(self, other))
@@ -126,6 +146,18 @@ class Schedule:
     def lift(cls, f, delay_stream=itertools.repeat(0)):
         return Schedule(lift(f, delay_stream))
 
+    @classmethod
+    def recur_until(cls, pred, delay_stream=itertools.repeat(0)):
+        return Schedule(recur_until(pred, delay_stream))
+
+    @classmethod
+    def recur_while(cls, pred, delay_stream=itertools.repeat(0)):
+        return Schedule(recur_while(pred, delay_stream))
+
+    @classmethod
+    def accumulate(cls, f, delay_stream=itertools.repeat(0), initial=identity):
+        return Schedule(accumulate(f, delay_stream, initial=initial))
+    
 
 def limit(schedule, n: int):
     input_ = (yield)
@@ -152,7 +184,7 @@ def lift(f: Callable[[A], B], delay_stream):
         input_ = yield (f(input_), d)
     
 
-def chain(*schedules: Schedule[A, B]) -> Generator[A, B]:
+def chain(*schedules: Schedule[A, B]) -> Generator[A, B, None]:
     """
     Schedule combinator performing sequential chaining of multiple schedules.
     Creates a new schedule state that runs each schedule to conclusion in sequence.
@@ -170,7 +202,7 @@ def chain(*schedules: Schedule[A, B]) -> Generator[A, B]:
 C = TypeVar("C")
             
             
-def intersection(a: Schedule[A, B], b: Schedule[A, C]) -> Generator[A, Tuple[B, C]]:
+def intersection(a: Schedule[A, B], b: Schedule[A, C]) -> Generator[Tuple[B, C], A, None]:
     """
     Schedule combinator performing the intersection of two schedules.
     Create a new schedule state that runs both schedules concurrently 
@@ -202,7 +234,7 @@ def intersection(a: Schedule[A, B], b: Schedule[A, C]) -> Generator[A, Tuple[B, 
             input_ = yield (oa, ob), max(da, db)
 
             
-def union(a: Schedule[A, B], b: Schedule[A, C]) -> Generator[A, Tuple[B, C]]:
+def union(a: Schedule[A, B], b: Schedule[A, C]) -> Generator[Tuple[B, C], A, None]:
     """
     Schedule combinator performing the union of two schedules, 
     creating a new schedule which continues 
@@ -242,6 +274,32 @@ def union(a: Schedule[A, B], b: Schedule[A, C]) -> Generator[A, Tuple[B, C]]:
             return
 
 
+def recur_until(pred, delay_stream):
+    input_ = (yield)
+    for d in delay_stream:
+        if not pred(input_):
+            input_ = yield (input_, d)
+        else:
+            break
+        
+def recur_while(pred, delay_stream):
+    input_ = (yield)
+    for d in delay_stream:
+        if pred(input_):
+            input_ = yield (input_, d)
+        else:
+            break
+
+def accumulate(f, delay_stream, initial=identity):
+    """Schedule that outputs a state computed from a reduction of inputs"""
+    input_ = (yield)
+    acc = initial(input_)
+    for d in delay_stream:
+        input_ = yield (acc, d)
+        acc = f(acc, input_)
+
+
+        
 
 async def retry(f: Callable[..., Awaitable[A]], schedule: Schedule):
     """

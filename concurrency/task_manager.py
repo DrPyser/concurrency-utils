@@ -83,49 +83,34 @@ class TaskGroupClosedError(Exception):
         super().__init__("Invalid operation on closed TaskGroup")
         self.task_group = task_group
 
-
-# Done = object()
         
-# def const(x):
-#     return lambda y: x
-
-
-# def reraise_first(task_group, pred=const(True)):
-#     while True:
-#         try:
-#             x = (yield)
-#         except GeneratorExit:
-#             raise
-#         except Exception as ex:
-#             if pred(ex):
-#                 raise ex from ex
-#         else:
-#             if x is Done:    
-#                 return
-
-# def reraise_multi(task_group, pred=const(True)):
-#     exceptions = []
-#     # TODO
-#     while True:
-#         try:
-#             (yield)
-#         except GeneratorExit:
-#             raise
-#         except Exception as ex:
-#             if pred(ex):
-#                 exceptions.append(ex)
-
-
-async def default_join_policy(tasks, timeout=None):
+async def preempt(tasks, timeout=None):
     waiter = asyncio.gather(*tasks)
     if timeout is not None:
         return await asyncio.wait_for(waiter, timeout)
     else:
         return await waiter
+
     
+async def wait_for_all(tasks, timeout=None, on_cancellation=None, on_exception=None):
+    waiter = asyncio.wait(tasks, timeout=timeout)
+    done, pending = await waiter
+    for t in pending:
+        t.cancel()
+    cancellations = [
+        t for t in done if t.cancelled()
+    ]
+    # TODO: 
+    exceptions = [
+        (t, t.exception())
+        for t in done
+        if not t.cancelled() and t.exception() is not None
+    ]
+        
+
 
 class TaskGroup(TaskManager):
-    def __init__(self, tasks=(), join_policy=default_join_policy, logger=None, loop=None, name=None):
+    def __init__(self, tasks=(), join_policy=preempt, logger=None, loop=None, name=None):
         self.name = name or str(id(self))
         self._tasks = set(tasks)
         self.logger = logger or logging.getLogger(

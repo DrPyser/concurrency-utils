@@ -1,10 +1,15 @@
 import concurrent.futures
 import asyncio
-from typing import Callable, Union, Iterable, Awaitable
+from typing import (
+    Callable, Union,
+    Iterable, Awaitable,
+    AsyncIterator, AsyncIterable,
+    TypeVar
+)
 import functools
+import itertools
 import time
 import datetime
-
 
 class DefaultAsynchronousSettings:
     @property
@@ -61,7 +66,43 @@ def link_tasks(t1: Union[asyncio.Task, asyncio.Future], t2: Union[asyncio.Task, 
     t1.add_done_callback(functools.partial(propagate_failure(t2)))
     t2.add_done_callback(functools.partial(propagate_failure(t1)))
 
+
+T = TypeVar("T")
+
+
+async def anext(ait: AsyncIterator[T]) -> T:
+    return await ait.__anext__()
     
+
+async def aiter(ait: AsyncIterable[T]) -> AsyncIterator[T]:
+    return ait.__aiter__()
+
+
+class Ticker:
+    __slots__ = ["_delay_stream"]
+    
+    def __init__(self, delay_stream):
+        self._delay_stream = enumerate(delay_stream)
+
+    async def __anext__(self):
+        try:
+            i, delay = next(self._delay_stream)
+        except StopIteration:
+            raise StopAsyncIteration
+        else:
+            await asyncio.sleep(delay)
+            return i
+
+    def __aiter__(self):
+        return self
+
+    @classmethod
+    def constant(cls, t, limit=None):
+        repeater = itertools.repeat(t, limit) if limit is not None\
+            else itertools.repeat(t)
+        return cls(repeater)
+
+
 import logging
 
 
@@ -136,6 +177,7 @@ class Supervisor:
             
 
 LOGGER = logging.getLogger(__name__)
+
 
 async def main():
     # settings = DefaultAsynchronousSettings()

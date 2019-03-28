@@ -1,5 +1,9 @@
 from concurrency.threads.utils import spawn
 
+
+POLL_TIMEOUT = 0.01
+
+
 class ThreadScopeErrors(Exception):
     def __init__(self, exceptions, scope):
         self.exceptions = exceptions

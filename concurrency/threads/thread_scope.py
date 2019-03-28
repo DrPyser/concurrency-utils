@@ -1,12 +1,4 @@
-import threading
-
-POLL_TIMEOUT = 0.01
-
-
-def spawn(f, *args, **kwargs):
-    t = threading.Thread(target=f, args=args, kwargs=kwargs)
-    t.start()
-    return t
+from concurrency.threads.utils import spawn
 
 class ThreadScopeErrors(Exception):
     def __init__(self, exceptions, scope):
@@ -60,3 +52,5 @@ class ThreadScope:
 
     def __exit__(self, exc_type, exc_val, exc_tb):
         self.join_all()
+
+        

@@ -11,6 +11,7 @@ import itertools
 import time
 import datetime
 
+
 class DefaultAsynchronousSettings:
     @property
     def loop(self):
@@ -76,6 +77,96 @@ async def anext(ait: AsyncIterator[T]) -> T:
 
 async def aiter(ait: AsyncIterable[T]) -> AsyncIterator[T]:
     return ait.__aiter__()
+
+
+class AsyncIteratorWrapper(AsyncIterator[T]):
+    def __init__(self, it: Iterable[T], buffer_size=0):
+        self._source = iter(it)
+        self._tasks = set()
+        self._cancelled = asyncio.Event()
+        self._other_loop = None
+        self._buffer = asyncio.Queue(buffer_size)
+
+    @staticmethod
+    async def _iterate(source, cancelled):
+        try:
+            while not cancelled.is_set():
+                yield next(source)
+                await asyncio.sleep(0)
+        except StopIteration:
+            return
+
+    def _start(self):
+        async def fill_buffer(buffer, source, cancelled, iterate):
+            iterator = iterate(source, cancelled)
+            try:
+                while True:
+                    i = await anext(iterator)
+                    await buffer.put(i)
+            except StopAsyncIteration:
+                return
+        def do_work(loop, buffer, source, cancelled, iterate):
+            asyncio.set_event_loop(loop)
+            loop.run_until_complete(fill_buffer(buffer, source, cancelled, iterate))
+
+        self._other_loop = asyncio.new_event_loop()
+        iterate_task = asyncio.run_in_executor(
+                self._executor,
+            functools.partial(
+                do_work,
+                loop,
+                self._buffer,
+                self._source,
+                self._cancelled,
+                self._iterate
+            )
+        )
+        self._tasks.add(
+            iterate_task
+        )
+        self._iterate_task = iterate_task
+        
+    async def __anext__(self):
+        if self._other_loop is None:
+            self._start()
+
+        if self._cancelled.is_set():
+            raise asyncio.CancelledError
+        elif not self._other_loop.is_running():
+            raise StopAsyncIteration
+        elif ...:
+            ...
+            
+        queue_task, cancel_task = (
+            asyncio.create_task(c)
+            for c in (
+                    self._buffer.get(),
+                    self._cancelled.wait()
+            )
+        )
+        winner = await race([queue_task, cancel_task])
+        if winner is queue_task:
+            return await queue_task
+        else:
+            assert self._cancelled.is_set()
+            assert not self._other_loop.is_running()
+            assert all(t.done() for t in self._tasks)
+            raise asyncio.CancelledError
+        
+
+                
+    
+    def __aiter__(self):
+        return self
+    
+
+def primed(f):
+    @functools.wraps(f)
+    def wrapped(*args, **kwargs):
+        c = f(*args, **kwargs)
+        next(c)
+        return c
+    return wrapped
 
 
 class Ticker:
@@ -179,57 +270,57 @@ class Supervisor:
 LOGGER = logging.getLogger(__name__)
 
 
-async def main():
-    # settings = DefaultAsynchronousSettings()
-    # asynchronous_ = asynchronous(settings)
+# async def main():
+#     # settings = DefaultAsynchronousSettings()
+#     # asynchronous_ = asynchronous(settings)
 
-    # @asynchronous_
-    # def test(i):
-    #     print("See you in {} seconds".format(i))
-    #     time.sleep(i)
-    #     print("Done!")
-    #     return i
+#     # @asynchronous_
+#     # def test(i):
+#     #     print("See you in {} seconds".format(i))
+#     #     time.sleep(i)
+#     #     print("Done!")
+#     #     return i
 
-    # now = datetime.datetime.utcnow()
-    # print(now)
-    # results = await asyncio.gather(
-    #     test(2),
-    #     test(5),
-    #     test(3),
-    #     test(1),
-    #     test(5),
-    #     test(5),
-    #     test(5),
-    #     test(5),
-    #     test(5),
-    #     test(5),
-    #     test(5),
-    # )
-    # then = datetime.datetime.utcnow()
-    # print(then)
-    # print("duration {}".format(then-now))
-    # print(results)
-    async def faulty_routine():
-        print("starting faulty_routine")
-        while True:
-            await asyncio.sleep(1)
-            raise Exception("faulty_routine failed!")
+#     # now = datetime.datetime.utcnow()
+#     # print(now)
+#     # results = await asyncio.gather(
+#     #     test(2),
+#     #     test(5),
+#     #     test(3),
+#     #     test(1),
+#     #     test(5),
+#     #     test(5),
+#     #     test(5),
+#     #     test(5),
+#     #     test(5),
+#     #     test(5),
+#     #     test(5),
+#     # )
+#     # then = datetime.datetime.utcnow()
+#     # print(then)
+#     # print("duration {}".format(then-now))
+#     # print(results)
+#     async def faulty_routine():
+#         print("starting faulty_routine")
+#         while True:
+#             await asyncio.sleep(1)
+#             raise Exception("faulty_routine failed!")
 
-    async def other_routine():
-        print("starting other_routine")
-        while True:
-            await asyncio.sleep(1)
-            print("Doing things")
+#     async def other_routine():
+#         print("starting other_routine")
+#         while True:
+#             await asyncio.sleep(1)
+#             print("Doing things")
 
-    try:
-        async with TaskGroup() as g:
-            t1 = g.spawn(faulty_routine())
-            t2 = g.spawn(other_routine())
-    except:
-        LOGGER.exception("Error")
+#     try:
+#         async with TaskGroup() as g:
+#             t1 = g.spawn(faulty_routine())
+#             t2 = g.spawn(other_routine())
+#     except:
+#         LOGGER.exception("Error")
 
-    tasks = map(asyncio.create_task, (faulty_routine(), other_routine()))
-    await TaskGroup(tasks=tasks)
+#     tasks = map(asyncio.create_task, (faulty_routine(), other_routine()))
+#     await TaskGroup(tasks=tasks)
         
     
 if __name__ == "__main__":

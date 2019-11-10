@@ -12,7 +12,7 @@ Examples of application include retrying a task on transient errors, or repeatin
 
 ## TaskManager and TaskGroup
 From task_manager package.
-Taken directly from Curio's TaskGroup, Trio's nursery, and other similar constructs, and ported to asyncio.
+Inspired by Curio's TaskGroup, Trio's nursery, and other similar constructs, implemented for asyncio.
 
 ## Thread utilities
 Some utilities and abstractions for working with thread.

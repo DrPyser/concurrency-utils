@@ -51,6 +51,7 @@ class ThreadScope:
                 try:
                     t.start()
                 except RuntimeError:
+                    # TODO: log
                     pass
         return self
 

@@ -172,7 +172,7 @@ def map_schedule(f, schedule):
         try:
             out, d = schedule.update(input_)            
         except ScheduleConcluded:
-            # break out of while loop, go to next schedule
+            # break out of while loop
             break
         else:
             input_ = yield f(out), d
@@ -300,8 +300,8 @@ def accumulate(f, delay_stream, initial=identity):
 
 
         
-
-async def retry(f: Callable[..., Awaitable[A]], schedule: Schedule):
+OpinionT = TypeVar("OpinionT")
+async def retry(f: Callable[..., Awaitable[A]], schedule: Schedule[Exception, Tuple[OpinionT, float]]):
     """
     Run an awaitable computation, 
     retrying on failures according to a schedule.
@@ -317,8 +317,19 @@ async def retry(f: Callable[..., Awaitable[A]], schedule: Schedule):
             else:
                 await asyncio.sleep(delay)
                 # TODO: do something with opinion
+                yield (ex, opinion)
         else:
             return result
+
+        
+def result(retry_generator):
+    try:
+        while True:        
+            next(retry_generator)
+    except StopIterator as ex:
+        return ex.value
+
+
 
 
 async def repeat(f: Callable[..., Awaitable[A]], schedule: Schedule):

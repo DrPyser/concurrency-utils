@@ -12,6 +12,10 @@ import time
 import datetime
 
 
+spawn = asyncio.create_task
+"""An alias for asyncio.create_task"""
+
+
 class DefaultAsynchronousSettings:
     @property
     def loop(self):
@@ -50,11 +54,10 @@ async def race(aws: Iterable[Awaitable], timeout=None):
     else:
         # wait for all tasks to finish, i.e. for cancellation to propagate
         await asyncio.wait(aws, return_when=asyncio.ALL_COMPLETED)
-    assert all(t.done() for t in pending), str(pending)
+    assert all(t.done() for t in pending), f"Cancelled tasks still pending"
     assert all(t.done() for t in done)
-    #assert len(done) <= 1
     # note: there may be more than 1 task in done, but we only return one "winner"
-    return done.pop()
+    return done
 
 
 def link_tasks(t1: Union[asyncio.Task, asyncio.Future], t2: Union[asyncio.Task, asyncio.Future]):
@@ -75,7 +78,7 @@ async def anext(ait: AsyncIterator[T]) -> T:
     return await ait.__anext__()
     
 
-async def aiter(ait: AsyncIterable[T]) -> AsyncIterator[T]:
+def aiter(ait: AsyncIterable[T]) -> AsyncIterator[T]:
     return ait.__aiter__()
 
 
@@ -144,18 +147,15 @@ class AsyncIteratorWrapper(AsyncIterator[T]):
                     self._cancelled.wait()
             )
         )
-        winner = await race([queue_task, cancel_task])
-        if winner is queue_task:
+        winners = await race([queue_task, cancel_task])
+        if queue_task in winners:
             return await queue_task
         else:
             assert self._cancelled.is_set()
             assert not self._other_loop.is_running()
             assert all(t.done() for t in self._tasks)
             raise asyncio.CancelledError
-        
 
-                
-    
     def __aiter__(self):
         return self
     
@@ -267,7 +267,55 @@ class Supervisor:
                 await self.supervise()
             
 
+
+
+
+
+async def select(tasks):
+    """Checks if a task is done. If so, returns one, otherwise returns None"""
+    done = set(t for t in tasks if t.done())
+    if done:
+        return done.pop()
+
+# if False:
+#     r1, w1 = channel(1)
+#     r2, w2 = channel(1)
+#     spawn(client_a(w1))
+#     spawn(client_ (w2))
+#     receive_a = spawn(r1.receive())
+#     receive_b = spawn(r2.receive())
+#     tasks = [receive_a, receive_b]
+#     while True:
+#         t = select(tasks)
+#         if t is receive_a:
+#             result = await t
+#             # handle a
+#             ...
+#         elif t is receive_b:
+#             result = await t
+#             # handle b
+#             ...
+#         else:
+#             assert t is None
+#             print("Still waiting")
+
+
+async def after(n: float, f, *args, **kwargs):
+    """call async function after n seconds"""
+    await asyncio.sleep(n)
+    return await f(*args, **kwargs)
+
+
+# if False:
+#     async def foo(i):
+#         print("Hello: ", i)
+#         return i    
+#     result = await after(10, foo, 1)
+
+                
 LOGGER = logging.getLogger(__name__)
+
+
 
 
 # async def main():

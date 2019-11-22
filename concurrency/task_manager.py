@@ -1,6 +1,11 @@
 import abc
 import types
-from typing import FrozenSet, Callable, Union, Iterable, Awaitable, TypeVar, Generic, Any, Mapping
+from typing import (
+    FrozenSet, Callable, Union,
+    Iterable, Awaitable, TypeVar,
+    Generic, Any, Mapping,
+    AsyncContextManager
+)
 import concurrent.futures
 import asyncio
 import functools
@@ -10,7 +15,7 @@ import logging
 import enum
 
 
-class TaskManager(abc.ABC):
+class TaskManager(AsyncContextManager, abc.ABC):
     """
     Basic interface for objects that represent a group of tasks
     that are managed together.
@@ -30,7 +35,47 @@ class TaskManager(abc.ABC):
         Cancel all tasks managed by this TaskManager
         """
         pass    
-    
+
+
+
+class BaseTaskManager(TaskManager):
+    def __init__(self, tasks=()):
+        self._tasks = set(tasks)
+
+    @property
+    def tasks(self):
+        return frozenset(self._tasks)
+        
+    def spawn(self, coro):
+        task = asyncio.create_task(coro)
+        self._tasks.add(task)
+        return task
+
+    def add_tasks(self, *tasks: asyncio.Task):
+        self._tasks.update(tasks)
+
+    def remove_tasks(self, *tasks: asyncio.Task):
+        self._tasks.difference_update(tasks)
+
+    async def join(self):
+        await asyncio.wait(self._tasks, return_when=asyncio.ALL_COMPLETED)
+
+    def cancel(self):
+        for t in self._tasks:
+            t.cancel()
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, exc_type, exc_val, exc_tb):
+        if exc_val is not None:
+            self.cancel()
+        await self.join()
+
+    async def __aiter__(self):
+        for t in asyncio.as_completed(self._tasks):
+            yield await t
+        
     
 async def entangle(tasks, propagate=False, logger=None):
     """
@@ -174,61 +219,6 @@ async def race(*tasks):
         p.cancel()
     return completed
     
-
-            
-class MailboxClosed(Exception): pass
-
-class Mailbox:
-    def __init__(self, queue):
-        self.queue = queue
-        self.closed = asyncio.Event()
-        
-    async def receive(self, ack=True):
-        if self.closed.is_set():
-            raise MailboxClosed
-        queue_task = asyncio.create_task(self.queue.get())
-        closed_task = asyncio.create_task(self.closed.wait())
-        winners = await race(queue_task, closed_task)
-        if queue_task in winners:
-            value = await queue_task
-            if ack:
-                self.queue.task_done()
-            return value
-        else:
-            raise MailboxClosed
-
-    async def __aiter__(self):
-        while True:
-            try:
-                yield await self.receive()
-            except MailboxClosed:
-                break
-
-    def close(self):
-        self.closed.set()
-            
-            
-class Broadcast:
-    subscribers: Mapping[str, asyncio.Queue]
-
-    def __init__(self, subscribers=()):
-        self.subscribers = dict(subscribers)
-
-    def publish(self, value):
-        for s in self.subscribers.values():
-            if s.full():
-                # discard oldest item from queue
-                # TODO: log this
-                s.get_nowait()
-            s.put_nowait(value)
-
-    def subscribe(self, name, buffer_size=0):
-        self.subscribers[name] = new_queue = asyncio.Queue(buffer_size)
-        return Mailbox(new_queue)
-
-    def unsubscribe(self, name):
-        self.subscribers.pop(name, None)
-
         
 class TaskGroup(TaskManager):
     def __init__(self, tasks=(), join_policy=preempt, logger=None, loop=None, name=None):

@@ -4,13 +4,17 @@ from typing import (
     Callable, Union,
     Iterable, Awaitable,
     AsyncIterator, AsyncIterable,
-    TypeVar
+    TypeVar, NamedTuple, Generic, Any,
+    List
 )
+import typing
 import functools
 import itertools
 import time
 import datetime
+import types
 
+T = TypeVar("T")
 
 spawn = asyncio.create_task
 """An alias for asyncio.create_task"""
@@ -47,17 +51,143 @@ def asynchronous(settings: object=DefaultAsynchronousSettings()):
     return decorator
 
 
-async def race(aws: Iterable[Awaitable], timeout=None):
-    done, pending = await asyncio.wait(aws, timeout=timeout, return_when=asyncio.FIRST_COMPLETED)
-    for t in pending:
-        t.cancel()
-    else:
-        # wait for all tasks to finish, i.e. for cancellation to propagate
-        await asyncio.wait(aws, return_when=asyncio.ALL_COMPLETED)
+async def race(*aws: Awaitable):
+    tasks = [asyncio.ensure_future(aw) for aw in aws]
+    done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+    if pending:
+        for t in pending:
+            t.cancel()
+        else:
+            # wait for all tasks to finish, i.e. for cancellation to propagate
+            await asyncio.wait(pending, return_when=asyncio.ALL_COMPLETED)
     assert all(t.done() for t in pending), f"Cancelled tasks still pending"
     assert all(t.done() for t in done)
-    # note: there may be more than 1 task in done, but we only return one "winner"
     return done
+
+
+async def select(cases: dict):
+    tasks = {
+        key: asyncio.ensure_future(t)
+        for key, t in cases.items()
+    }
+    tasks_keys = {
+        f: key
+        for key, f in tasks.items()
+    }
+    try:
+        winners = await race(tasks.values())
+    except asyncio.TimeoutError:
+        if asyncio.TimeoutError in cases:
+            return cases[asyncio.TimeoutError]()
+        else:
+            raise
+    else:
+        assert winners <= tasks_keys.keys()
+        return {
+            tasks_keys[t]: t
+            for t in winners
+        }
+
+
+async def select_handlers(cases: dict):
+    task_handlers = {
+        asyncio.ensure_future(aw): handler
+        for aw, handler in cases.items()
+        if not isinstance(aw, asyncio.TimeoutError) or aw is not None
+    }
+    try:
+        winners = await race(tasks.values(), timeout=timeout)
+    except asyncio.TimeoutError:
+        if asyncio.TimeoutError in cases:
+            return cases[asyncio.TimeoutError]()
+        else:
+            raise
+    else:
+        winner = winners.pop()
+        return task_handlers[winner](await winner)
+
+
+Default = object()
+    
+async def select_now(cases: dict):
+    futures = {
+        key: asyncio.ensure_future(t)
+        for key, t in cases.items()
+    }
+    completed = next(((k, f) for k, f in futures.items() if f.done()), (None, None))
+    return completed
+
+if False:
+    key, task = select_now({
+        "r1": make_call(...),
+        "r2": make_call(...)
+    })
+    if key is None:
+        # default
+        ...
+    elif key == "r1":
+        result = await r1
+    elif key == "r2":
+        result = await r2
+    
+    
+
+def dataclass(klass):
+    annotations = typing.get_type_hints(klass)
+    def __init__(self, **kwargs):
+        for k, v in kwargs.items():
+            setattr(self, k, v)
+
+    def __repr__(self):
+        attrs = ", ".join("{k}={v}".format(k=k, v=getattr(self, k)) for k in self.__fields__)
+        return f"{self.__class__.__name__}({attrs})"
+
+    def extend_ns(ns):
+        ns.update(
+            __init__=__init__,
+            __slots__=list(annotations.keys()),
+            __fields__=list(annotations.keys()),
+            __repr__=__repr__
+        )
+    new_klass = types.new_class(klass.__name__, bases=(klass,), exec_body=extend_ns)
+    return new_klass
+
+E = TypeVar("E")
+
+class Outcome(Generic[E, T]):
+    @classmethod
+    def safely(cls, exc_types, f, *args, **kwargs):
+        try:
+            return Success(f(*args, **kwargs))
+        except exc_types as ex:
+            return Failure(ex)
+        
+    @classmethod
+    def safe_iter(cls, dangerous_iter):
+        it = iter(dangerous_iter)
+        while True:
+            try:
+                yield Success(next(it))
+            except StopIteration:
+                break
+            except Exception as ex:
+                yield Failure(ex)
+                
+
+@dataclass
+class Success(Outcome[E, T]):
+    value: T
+
+@dataclass
+class Failure(Outcome[E, T]):
+    value: E
+
+
+async def join(aws: Iterable[Awaitable[T]]) -> List[T]:
+    return [await f for f in asyncio.as_completed(aws)]
+
+async def safe_join(aws: Iterable[Awaitable[T]]) -> List[Outcome[Exception, T]]:
+    return list(Outcome.safe_iter(await f for f in asyncio.as_completed(aws)))
 
 
 def link_tasks(t1: Union[asyncio.Task, asyncio.Future], t2: Union[asyncio.Task, asyncio.Future]):
@@ -69,9 +199,6 @@ def link_tasks(t1: Union[asyncio.Task, asyncio.Future], t2: Union[asyncio.Task, 
 
     t1.add_done_callback(functools.partial(propagate_failure(t2)))
     t2.add_done_callback(functools.partial(propagate_failure(t1)))
-
-
-T = TypeVar("T")
 
 
 async def anext(ait: AsyncIterator[T]) -> T:
@@ -205,11 +332,6 @@ class RestartPolicy:
     ...          
 
 
-from typing import NamedTuple, TypeVar, Any
-
-T = TypeVar("T")
-
-
 class TaskSpec(NamedTuple):
     factory: Callable[..., Awaitable[T]]  # allow to create task instances
     restart_policy: RestartPolicy  # when to restart this task
@@ -265,41 +387,8 @@ class Supervisor:
             else:
                 # run supervision task
                 await self.supervise()
-            
 
-
-
-
-
-async def select(tasks):
-    """Checks if a task is done. If so, returns one, otherwise returns None"""
-    done = set(t for t in tasks if t.done())
-    if done:
-        return done.pop()
-
-# if False:
-#     r1, w1 = channel(1)
-#     r2, w2 = channel(1)
-#     spawn(client_a(w1))
-#     spawn(client_ (w2))
-#     receive_a = spawn(r1.receive())
-#     receive_b = spawn(r2.receive())
-#     tasks = [receive_a, receive_b]
-#     while True:
-#         t = select(tasks)
-#         if t is receive_a:
-#             result = await t
-#             # handle a
-#             ...
-#         elif t is receive_b:
-#             result = await t
-#             # handle b
-#             ...
-#         else:
-#             assert t is None
-#             print("Still waiting")
-
-
+                
 async def after(n: float, f, *args, **kwargs):
     """call async function after n seconds"""
     await asyncio.sleep(n)

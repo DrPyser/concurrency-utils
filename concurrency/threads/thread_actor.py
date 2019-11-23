@@ -10,7 +10,9 @@ from typing import (
     NamedTuple,
     Any,
     Callable,
-    Optional
+    Optional,
+    List,
+    Tuple
 )
 import functools
 import uuid
@@ -67,6 +69,61 @@ class Priority:
 class Actor:
     ref: ActorRef
     def send(self, message, sender, priority): pass
+
+
+
+class Timeout(NamedTuple):
+    after: int
+
+    def __call__(self, x):
+        return False
+    
+timeout = Timeout
+
+class Match(NamedTuple):
+    pred: Callable[..., bool]
+
+    def __call__(self, x):
+        return self.pred(x)
+
+match = Match
+
+
+Predicate = Callable[[Message], bool]
+        
+class Request:
+    class Self(NamedTuple):
+        pass
+
+    class Receive(NamedTuple):
+        expectations: List[Tuple[Predicate, Any]]
+
+    class Send(NamedTuple):
+        message: Any
+        target: ActorRef
+
+
+class Signal:
+    class Exit(NamedTuple):
+        reason: Any
+
+    class Kill(NamedTuple):
+        reason: Any
+        
+        
+class ExitSignalError(Exception):
+    def __init__(self, signal: Signal.Exit, actor_ref, reaction=None):
+        super().__init__(f"Exit signal received: {signal}")
+        self.signal = signal
+        self.reaction = reaction
+        self.actor = actor_ref
+
+
+class KillSignalError(Exception):
+    def __init__(self, signal: Signal.Kill, actor_ref):
+        super().__init__(f"Kill signal received: {signal}")
+        self.signal = signal
+        self.actor = actor_ref  
     
 
 class System:
@@ -99,24 +156,37 @@ class System:
             priority=Priority.NORMAL
         )
 
-    def shutdown(self, target, sender=None, priority=Priority.NORMAL):
+    def send_signal(self, signal, target, sender=None):
         actor = self._actors[target]
-        if actor.is_alive():
-            actor.send(
-                message=Shutdown,
-                sender=sender,
-                priority=priority
-            )
-        else:
-            # raise, log
-            ...
+        actor.send_signal(signal=signal, sender=sender)
 
-    def shutdown_all(self, priority=Priority.NORMAL):
-        print("Initiating shutdown of all actors")
+    def send_signal_all(self, signal, sender=None):
         for ref, actor in self._actors.items():
-            print(f"Shutting down actor {ref}")
-            self.shutdown(ref, None, priority)
-            
+            actor.send_signal(signal=signal, sender=sender)
+
+    def kill(self, target, reason=None, sender=None):
+        self.send_signal(Signal.Kill(reason=reason), target, sender=sender)
+
+    def exit(self, target, reason=None, sender=None):
+        self.send_signal(Signal.Exit(reason=reason), target, sender=sender)
+
+    def exit_all(self, reason=None, sender=None):
+        self.send_signal_all(Signal.Exit(reason=reason), sender=sender)
+
+    def kill_all(self, reason=None, sender=None):
+        self.send_signal_all(Signal.Kill(reason=reason), sender=sender)
+
+    def join(self, target, timeout=None):
+        actor = self._actors[target]
+        actor.join(timeout)
+        # Should raise TimeoutError if thread still alive
+
+    def join_all(self, timeout=None):
+        for actor in self._actors.values():
+            actor.join(timeout)
+        else:
+            # should raise TimeoutError if any thread still alive
+            pass
 
 class ThreadActorRef(ActorRef, tuple):
     def __new__(cls, actor_id, thread_id, name):
@@ -143,23 +213,10 @@ def find_index(pred, seq, default=None):
     return next(((i, x) for i, x in enumerate(seq) if pred(x)), default)
 
 
-class Timeout(NamedTuple):
-    after: int
-
-    def __call__(self, x):
-        return False
-    
-
-class Match(NamedTuple):
-    pred: Callable[..., bool]
-
-    def __call__(self, x):
-        return self.pred(x)
-    
-match = Match
 
 class Mailbox:
-    def __init__(self, q):
+    def __init__(self, q, logger=None):
+        self.logger = logger or logging.getLogger(f"{self.__class__.__module__}.{self.__class__.__qualname__}")
         self.queue = q
         self.storage = []
 
@@ -182,7 +239,7 @@ class Mailbox:
         if found is not None:
             index, message, key = found
             self.storage.pop(index)
-            print("Found matching message in storage for match key {key}")
+            self.logger.info("Found matching message in storage for match key %s", key)
             return message, key
         else:
             timeout_key, timeout = next((
@@ -191,16 +248,16 @@ class Mailbox:
                 if isinstance(cond, Timeout)
             ), (None, None))
             for m in iter_queue(self.queue, timeout=timeout):
-                print("Reading new message from queue: ", m)
+                self.logger.info("Reading new message from queue: %s", m)
                 match_key = next(poll(expectations, m), None)
                 if match_key is not None:
-                    print(f"Found matching message for match key {match_key}")
+                    self.logger.info("Found matching message for match key %s", match_key)
                     return m, match_key
                 else:
-                    print(f"Message {m} not expected, storing and skipping.")
+                    self.logger.info("Message %s not expected, storing and skipping.", m)
                     self.storage.append(m)
             else:
-                print("Timeout on select.")
+                self.logger.info("Timeout on select")
                 # timeout
                 assert timeout is not None
                 return None, timeout_key
@@ -217,22 +274,21 @@ class Mailbox:
             yield m
             count += 1
             if n != -1 and count >= n:
-                break
-
-
-
-          
-            
+                break       
+        
+        
 class ThreadActor(threading.Thread):   
     def __init__(self, system, actor_id, init, init_args, poll_timeout=POLL_TIMEOUT):
         super().__init__()
+        self.logger = logging.getLogger(f"{self.__class__.__module__}.{self.__class__.__qualname__}.{init.__name__}")
         self.system = system
         self.actor_id = actor_id
         self.init = init
         self.init_args = init_args
         self.poll_timeout = poll_timeout
         self.dispatcher = None
-        self.mailbox = Mailbox(queue.SimpleQueue())
+        self.mailbox = Mailbox(queue.SimpleQueue(), self.logger.getChild("mailbox"))
+        self.signal_queue = queue.SimpleQueue()
 
     @property
     def ref(self):
@@ -241,8 +297,68 @@ class ThreadActor(threading.Thread):
     def receive(self, expectations):
         return self.mailbox.select(expectations)
 
+    def handle_signal(self, signal, coro):
+        if isinstance(signal, Signal.Kill):
+            # Just raise exception, without allowing any cleanup of user state
+            raise KillSignalError(signal, self.ref)
+        elif isinstance(signal, Signal.Exit):
+            try:
+                reaction = coro.throw(ExitSignalError(signal, self.ref))
+            except ExitSignalError:
+                # exception was not handled
+                raise
+            except Exception as ex:
+                # another exception occured
+                raise
+            else:
+                # exception was handled. 
+                raise ExitSignalError(signal, self.ref, reaction)
+            finally:
+                # make sure generator terminates and has no remaining state
+                coro.close()
+
+    def handle_request(self, request, coro):
+        if request is None:
+            return coro.send(None)
+        elif isinstance(request, Request.Self):
+            return coro.send(self.ref)
+        elif isinstance(request, Request.Send):
+            target = request.target
+            message = request.message
+            self.system.send(message, target, self.ref)
+            return coro.send(None)
+        elif isinstance(request, Request.Receive):
+            result = self.receive(request.expectations)
+            return coro.send(result)
+                
     def run(self):
-        self.init(self, *self.init_args)
+        coro = self.init(*self.init_args)
+        request = None
+        while True:
+            try:
+                self.logger.info("Checking for signals")
+                signal = self.signal_queue.get_nowait()
+            except queue.Empty:
+                # run user code
+                try:
+                    self.logger.info("Handling user code")
+                    request = self.handle_request(request, coro)
+                except StopIteration as ex:
+                    # user code terminated normally
+                    # do something with ex.value?
+                    self.logger.info(f"User routine terminated normally with return value {ex.value}")
+                    break
+            else:
+                self.logger.info("Received signal: %s", signal)
+                # handle signal
+                try:
+                    self.handle_signal(signal, coro)
+                except ExitSignalError:
+                    self.logger.info("Terminating following exit signal")
+                    break
+                except KillSignalError:
+                    self.logger.info("Terminating following kill signal")
+                    break
 
     def send(self, message, sender, priority=Priority.NORMAL):
         if not self.is_alive():
@@ -250,44 +366,50 @@ class ThreadActor(threading.Thread):
         else:
             self.mailbox.send(Message(priority=priority, sender=sender, data=message))
 
+    def send_signal(self, signal, sender):
+        if not self.is_alive():
+            raise ActorTerminated(self)
+        else:
+            self.signal_queue.put_nowait(signal)
+        
 
 
-def pong(self):
+def pong():
     while True: 
-        message, key = self.receive([ 
+        message, key = yield Request.Receive([
             ("ping", Match(lambda m: m.data == "ping")),
             ("shutdown", Match(lambda m: m.data is Shutdown)), 
             ("timeout", Timeout(5))
         ])
         if key == "ping":
-            print("Received ping")
+            print("Received ping", flush=True)
             sender = message.sender
             if sender is not None:
-                self.system.send("pong", message.sender, self.ref)
-                self.system.send(Shutdown, message.sender, self.ref)
+                yield Request.Send("pong", message.sender)
+                #yield Request.Send(Shutdown, message.sender)
         elif key == "shutdown":
-            print("okay, goodbye") 
+            print("okay, goodbye", flush=True)
             break
-        elif key == "timeout": 
-            print("Took a bit too long") 
+        elif key == "timeout":
+            print("Took a bit too long", flush=True)
 
 
-def ping(self, server):
-    self.system.send("ping", server, self.ref)
+def ping(server):
     while True:
-        message, key = self.receive([
+        yield Request.Send("ping", server)
+        message, key = yield Request.Receive([
             ("reply", Match(lambda m: m.data == "pong")),
-            ("shutdown", Match(lambda m: m.data is Shutdown)), 
+            ("shutdown", Match(lambda m: m.data is Shutdown)),
             ("timeout", Timeout(5))
         ])
         if key == "reply":
-            print(f"Received reply to ping from {message.sender}")
-            self.system.send(Shutdown, server, self.ref)
-        elif key == "shutdown": 
-            print("okay, goodbye") 
+            print(f"Received reply to ping from {message.sender}", flush=True)
+            #yield Request.Send(Shutdown, server)
+        elif key == "shutdown":
+            print("okay, goodbye", flush=True)
             break
         elif key == "timeout": 
-            print("Took a bit too long") 
+            print("Took a bit too long", flush=True) 
             
     
 if __name__ == "__main__":
@@ -296,5 +418,7 @@ if __name__ == "__main__":
 
     a = system.spawn(pong)
     b = system.spawn(ping, (a,))
+    time.sleep(10)
+    system.exit_all("because")
     # system.send(Shutdown, a)
     # system.send(Shutdown, b)

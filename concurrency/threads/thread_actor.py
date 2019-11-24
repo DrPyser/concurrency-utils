@@ -19,7 +19,9 @@ import uuid
 import logging
 import collections
 import time
-
+import asyncio
+import concurrency.utils
+import concurrent.futures
 
 Shutdown = object()
 POLL_TIMEOUT = 0.1
@@ -102,6 +104,9 @@ class Request:
         message: Any
         target: ActorRef
 
+    class Wait(NamedTuple):
+        duration: float
+        
 
 class Signal:
     class Exit(NamedTuple):
@@ -150,19 +155,30 @@ class System:
 
     def send(self, message, target, sender=None):
         actor = self._actors[target]
-        actor.send(
+        asyncio.run_coroutine_threadsafe(actor.send(
             message=message,
             sender=sender,
             priority=Priority.NORMAL
-        )
+        ), actor.loop).result()
 
     def send_signal(self, signal, target, sender=None):
         actor = self._actors[target]
-        actor.send_signal(signal=signal, sender=sender)
+        asyncio.run_coroutine_threadsafe(
+            actor.send_signal(signal=signal, sender=sender),
+            actor.loop
+        ).result()
 
     def send_signal_all(self, signal, sender=None):
+        futures = []
         for ref, actor in self._actors.items():
-            actor.send_signal(signal=signal, sender=sender)
+            futures.append(
+                asyncio.run_coroutine_threadsafe(
+                    actor.send_signal(signal=signal, sender=sender),
+                    actor.loop
+                )
+            )
+        else:
+            concurrent.futures.wait(futures)
 
     def kill(self, target, reason=None, sender=None):
         self.send_signal(Signal.Kill(reason=reason), target, sender=sender)
@@ -188,6 +204,7 @@ class System:
             # should raise TimeoutError if any thread still alive
             pass
 
+        
 class ThreadActorRef(ActorRef, tuple):
     def __new__(cls, actor_id, thread_id, name):
         return tuple.__new__(cls, (actor_id, thread_id, name))    
@@ -202,6 +219,11 @@ def iter_queue(q: queue.Queue, timeout=None):
         else:
             yield value            
 
+async def aiter_queue(q: asyncio.Queue):
+    while True:
+        value = await q.get()
+        yield value
+        
             
 def poll(tests, value):
     for key, pred in tests:
@@ -220,10 +242,10 @@ class Mailbox:
         self.queue = q
         self.storage = []
 
-    def send(self, message):
-        self.queue.put(message)
+    async def send(self, message):
+        await self.queue.put(message)
 
-    def select(self, expectations):
+    async def select(self, expectations):
         expectations = list(expectations)
         message_matchers = list(
             (key, m)
@@ -247,29 +269,39 @@ class Mailbox:
                 for key, cond in expectations
                 if isinstance(cond, Timeout)
             ), (None, None))
-            for m in iter_queue(self.queue, timeout=timeout):
-                self.logger.info("Reading new message from queue: %s", m)
-                match_key = next(poll(expectations, m), None)
-                if match_key is not None:
-                    self.logger.info("Found matching message for match key %s", match_key)
-                    return m, match_key
-                else:
-                    self.logger.info("Message %s not expected, storing and skipping.", m)
-                    self.storage.append(m)
-            else:
+            # handle timeout by using asyncio.wait_for on this block of code
+            async def process_queue():
+                async for m in aiter_queue(self.queue):
+                    self.logger.info("Reading new message from queue: %s", m)
+                    match_key = next(poll(expectations, m), None)
+                    if match_key is not None:
+                        self.logger.info("Found matching message for match key %s", match_key)
+                        return m, match_key
+                    else:
+                        self.logger.info("Message %s not expected, storing and skipping.", m)
+                        self.storage.append(m)
+            try:
+                result = await asyncio.wait_for(process_queue(), timeout=timeout)
+            except asyncio.TimeoutError:
                 self.logger.info("Timeout on select")
                 # timeout
                 assert timeout is not None
                 return None, timeout_key
+            else:
+                return result
 
-    def __iter__(self):
-        yield from self.storage
-        yield from iter_queue(self.queue)
+    async def __aiter__(self):
+        for m in self.storage:
+            yield m
+        async for m in aiter_queue(self.queue):
+            self.storage.append(m)
+            yield m
 
-    def read(self, n=-1, timeout=None):
-        yield from self.storage
+    async def read(self, n=-1, timeout=None):
+        for m in self.storage:
+            yield m
         count = 0
-        for m in iter_queue(self.queue, timeout=timeout):
+        async for m in aiter_queue(self.queue, timeout=timeout):
             self.storage.append(m)
             yield m
             count += 1
@@ -278,7 +310,7 @@ class Mailbox:
         
         
 class ThreadActor(threading.Thread):   
-    def __init__(self, system, actor_id, init, init_args, poll_timeout=POLL_TIMEOUT):
+    def __init__(self, system, actor_id, init, init_args, poll_timeout=POLL_TIMEOUT, loop=None, mailbox=None, signal_queue=None):
         super().__init__()
         self.logger = logging.getLogger(f"{self.__class__.__module__}.{self.__class__.__qualname__}.{init.__name__}")
         self.system = system
@@ -287,17 +319,61 @@ class ThreadActor(threading.Thread):
         self.init_args = init_args
         self.poll_timeout = poll_timeout
         self.dispatcher = None
-        self.mailbox = Mailbox(queue.SimpleQueue(), self.logger.getChild("mailbox"))
-        self.signal_queue = queue.SimpleQueue()
-
+        self.mailbox = mailbox 
+        self.signal_queue = signal_queue
+        self.loop = loop
+        
+    def run(self):
+        if self.loop is None:
+            self.loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(self.loop)
+        if self.mailbox is None:
+            self.mailbox = Mailbox(asyncio.Queue(loop=self.loop), self.logger.getChild("mailbox"))
+        if self.signal_queue is None:
+            self.signal_queue = asyncio.Queue(loop=self.loop)
+            
+        async def _run():
+            coro = self.init(*self.init_args)            
+            request = None
+            while True:
+                winners = await concurrency.utils.select({
+                    "signal": asyncio.create_task(self.signal_queue.get()),
+                    "handle_request": asyncio.create_task(self.handle_request(request, coro))
+                })
+                if "signal" in winners:
+                    signal = await winners["signal"]
+                    self.logger.info("Received signal: %s", signal)
+                    # handle signal
+                    try:
+                        await self.handle_signal(signal, coro)
+                    except ExitSignalError:
+                        self.logger.info("Terminating following exit signal")
+                        break
+                    except KillSignalError:
+                        self.logger.info("Terminating following kill signal")
+                        break
+                elif "handle_request" in winners:
+                    try:
+                        request = await winners["handle_request"]
+                    except StopIteration as ex:
+                        # user code terminated normally
+                        # do something with ex.value?
+                        self.logger.info(f"User routine terminated normally with return value {ex.value}")
+                        break
+        try:
+            self.loop.run_until_complete(_run())
+        finally:
+            self.loop.run_until_complete(self.loop.shutdown_asyncgens())
+            self.loop.close()
+            
     @property
     def ref(self):
         return ThreadActorRef(self.actor_id, self.ident, self.name)
 
-    def receive(self, expectations):
-        return self.mailbox.select(expectations)
+    async def receive(self, expectations):
+        return await self.mailbox.select(expectations)
 
-    def handle_signal(self, signal, coro):
+    async def handle_signal(self, signal, coro):
         if isinstance(signal, Signal.Kill):
             # Just raise exception, without allowing any cleanup of user state
             raise KillSignalError(signal, self.ref)
@@ -317,7 +393,7 @@ class ThreadActor(threading.Thread):
                 # make sure generator terminates and has no remaining state
                 coro.close()
 
-    def handle_request(self, request, coro):
+    async def handle_request(self, request, coro):
         if request is None:
             return coro.send(None)
         elif isinstance(request, Request.Self):
@@ -328,50 +404,23 @@ class ThreadActor(threading.Thread):
             self.system.send(message, target, self.ref)
             return coro.send(None)
         elif isinstance(request, Request.Receive):
-            result = self.receive(request.expectations)
+            result = await self.receive(request.expectations)
             return coro.send(result)
-                
-    def run(self):
-        coro = self.init(*self.init_args)
-        request = None
-        while True:
-            try:
-                self.logger.info("Checking for signals")
-                signal = self.signal_queue.get_nowait()
-            except queue.Empty:
-                # run user code
-                try:
-                    self.logger.info("Handling user code")
-                    request = self.handle_request(request, coro)
-                except StopIteration as ex:
-                    # user code terminated normally
-                    # do something with ex.value?
-                    self.logger.info(f"User routine terminated normally with return value {ex.value}")
-                    break
-            else:
-                self.logger.info("Received signal: %s", signal)
-                # handle signal
-                try:
-                    self.handle_signal(signal, coro)
-                except ExitSignalError:
-                    self.logger.info("Terminating following exit signal")
-                    break
-                except KillSignalError:
-                    self.logger.info("Terminating following kill signal")
-                    break
+        elif isinstance(request, Request.Wait):
+            await asyncio.sleep(request.duration)
+            return coro.send(None)
 
-    def send(self, message, sender, priority=Priority.NORMAL):
+    async def send(self, message, sender, priority=Priority.NORMAL):
         if not self.is_alive():
             raise ActorTerminated(self)
         else:
-            self.mailbox.send(Message(priority=priority, sender=sender, data=message))
+            await self.mailbox.send(Message(priority=priority, sender=sender, data=message))
 
-    def send_signal(self, signal, sender):
+    async def send_signal(self, signal, sender):
         if not self.is_alive():
             raise ActorTerminated(self)
         else:
             self.signal_queue.put_nowait(signal)
-        
 
 
 def pong():
@@ -409,7 +458,8 @@ def ping(server):
             print("okay, goodbye", flush=True)
             break
         elif key == "timeout": 
-            print("Took a bit too long", flush=True) 
+            print("Took a bit too long", flush=True)
+        yield Request.Wait(1)
             
     
 if __name__ == "__main__":

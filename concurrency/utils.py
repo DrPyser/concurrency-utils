@@ -65,7 +65,8 @@ async def race(*aws: Awaitable):
     return done
 
 
-async def select(cases: dict):
+async def select(cases):
+    cases = dict(cases)
     tasks = {
         key: asyncio.ensure_future(t)
         for key, t in cases.items()
@@ -75,10 +76,12 @@ async def select(cases: dict):
         for key, f in tasks.items()
     }
     try:
-        winners = await race(tasks.values())
+        winners = await race(*tasks.values())
     except asyncio.TimeoutError:
         if asyncio.TimeoutError in cases:
-            return cases[asyncio.TimeoutError]()
+            return {
+                asyncio.TimeoutError: cases[asyncio.TimeoutError]
+            }
         else:
             raise
     else:
